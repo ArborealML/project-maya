@@ -102,6 +102,17 @@ def run(exe, pack, settings, lanes, prompts, folder):
                 unkeyed.append(tokens)
         assert primaries == {a: a2, b: b2}, "a late turn replaced a newer snapshot"
         assert anonymous in unkeyed, "an anonymous prompt lost its content-based slot"
+        # A new process reads those indexes. New HTTP order numbers start at one again. The whole
+        # parked prompt is now an exact prefix, including its edited tail.
+        eng = Engine(exe, args, measured_env)
+        try:
+            eng.start(1800)
+            assert turn(1, a2 + [a2[-1]], a, 1)[0] == len(a2)
+            assert turn(2, b2 + [b2[-1]], b, 2)[0] == len(b2)
+        finally:
+            if eng.proc is not None:
+                eng.quit()
+            eng.stderr_lines()
 
 
 def main():

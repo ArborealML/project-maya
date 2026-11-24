@@ -41,6 +41,26 @@ int main() {
     assert(!replaces_slot({}, {}, edited, old_tail));
     assert(!replaces_slot({}, first, continuation, old_tail));
 
+    // Replay 80 displaced turns through the native match/replacement predicates (no GPU). Each
+    // edit leaves the previous generated tail, so prefix-only coalescing would retain all 80 slots.
+    struct Stored { ThreadTurn thread; std::vector<int32_t> tokens; };
+    std::vector<Stored> store;
+    for (int32_t i = 0; i < 80; ++i) {
+        ThreadTurn thread{i % 2 == 0 ? a : b, (uint64_t) i + 1};
+        std::vector<int32_t> prompt{i % 2, 7, i + 8, 90};
+        size_t reused = 0;
+        for (const auto& slot : store)
+            reused = std::max(reused, slot_reuse(slot.tokens, prompt, {2, 4}, SIZE_MAX));
+        assert(reused == (i < 2 ? 0u : 2u));
+        store.erase(std::remove_if(store.begin(), store.end(), [&](const Stored& slot) {
+            return replaces_slot(thread, slot.thread, prompt, slot.tokens);
+        }), store.end());
+        store.push_back({thread, prompt});
+        assert(store.size() == (i == 0 ? 1u : 2u));
+    }
+    assert(store[0].thread.key == a && store[0].thread.order == 79);
+    assert(store[1].thread.key == b && store[1].thread.order == 80);
+
     std::vector<ConversationOwner> lanes{{first, false}, {other, false}, {second, false}, {}};
     ConversationOwner::parked(lanes, second);
     assert(lanes[0].retired && !lanes[1].retired && !lanes[2].retired && !lanes[3].retired);
