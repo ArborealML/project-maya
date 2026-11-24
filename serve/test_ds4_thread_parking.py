@@ -33,13 +33,13 @@ for line in sys.stdin:
 
 
 class ThreadHeader(unittest.TestCase):
-    def exercise(self, folder, lanes):
+    def exercise(self, folder, lanes, template="tools/ds4/chat_template.jinja"):
         peer, log = folder / "thread_peer.py", folder / "commands"
         peer.write_text(PEER, encoding="utf-8")
         peer.chmod(0o755)
         engine = StrataEngine(script_exe(peer), [str(lanes)], env={**os.environ, "MAYA_TEST_THREAD_LINE": str(log)})
         self.addCleanup(engine.close)
-        svc = Service(engine, Tok(), ChatTemplate(ROOT / "tools/ds4/chat_template.jinja"))
+        svc = Service(engine, Tok(), ChatTemplate(ROOT / template))
         httpd = serve(svc, port=0)
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
@@ -103,3 +103,8 @@ class ThreadHeader(unittest.TestCase):
     def test_four_lanes(self):
         with tempfile.TemporaryDirectory() as folder:
             self.exercise(Path(folder), 4)
+
+    def test_glm_flash(self):
+        for lanes in (1, 4):
+            with self.subTest(lanes=lanes), tempfile.TemporaryDirectory() as folder:
+                self.exercise(Path(folder), lanes, "serve/glm5_chat_template.jinja")

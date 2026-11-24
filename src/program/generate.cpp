@@ -14,6 +14,7 @@
 // AND IT IS PHASE 2, so hit rate is `h = 0` and the number it prints is slow on purpose
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
+#include "maya/program/glm_thread_slots.hpp"
 #include "maya/core/expert_cache.hpp"
 #include "maya/platform/env_alias.hpp"
 #include "maya/platform/idle_gate.hpp"
@@ -1380,17 +1381,23 @@ static int glm_pack_generate(const Options& o) {
     // (static: the multi path's Ctx, a local struct, uses it as a default member value - MSVC accepts that of a static
     // only, and a local constant left Ctx without a default constructor: "std::construct_at: no matching function")
     static constexpr uint64_t kNoImages = 1469598103934665603ull;   // img_hash() of a prefix without pictures
+    using maya::threads::ThreadTurn;
+    using maya::threads::ConversationOwner;
+    ThreadTurn req_thread;
+    int cur_ctx = 0;
+    std::vector<ConversationOwner> owners((size_t) model.seq_count());
     struct Slot {
         std::vector<int32_t> tokens;
         std::string path;                       // empty when the slot is a RAM buffer (slot_ram)
         uint64_t bytes = 0, used = 0;
-        std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
+        std::shared_ptr<std::vector<uint8_t>> data{};   // the RAM slot's bytes (null: a file slot)
         // a paused request's prompt (PAUSE keep): the next turn of that chat continues it, not the written answer
         // (its history drops the reasoning), so its own continuations do not supersede it until it is taken back
         bool anchor = false;
         // the end of a system prompt (slot_prefix): other chats start with it, so its conversation's later states
         // never supersede it - it goes only as the least recently used (#179)
         bool prefix = false;
+        ThreadTurn thread{};
         uint64_t img = kNoImages;               // img_hash() of the pictures in `tokens`
     };
     std::vector<Slot> slots;
@@ -1435,7 +1442,7 @@ static int glm_pack_generate(const Options& o) {
     constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
     const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes,
-                                 uint64_t img) -> bool {
+                                 uint64_t img, const ThreadTurn& thread) -> bool {
         const std::string tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -1448,6 +1455,7 @@ static int glm_pack_generate(const Options& o) {
             f.write((const char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t)));
             f.write((const char*) &img, 8);
             f.write((const char*) &kMetaMagic, 8);
+            maya::glm_slots::write_owner(f, thread);
             f.flush();
             if (!f) return false;
         }
@@ -1458,7 +1466,7 @@ static int glm_pack_generate(const Options& o) {
     // a .meta of this model -> its tokens, the slot's size and its pictures' hash (false: foreign, damaged or not
     // this model's)
     const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
-                               uint64_t& img) -> bool {
+                               uint64_t& img, ThreadTurn& thread) -> bool {
         std::ifstream f(path, std::ios::binary);
         uint64_t m0 = 0, il = 0, nt = 0, m1 = 0;
         if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
@@ -1467,8 +1475,9 @@ static int glm_pack_generate(const Options& o) {
         if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) o.max_context) return false;
         toks.resize(nt);
-        return (bool) f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) && f.read((char*) &img, 8) &&
-               f.read((char*) &m1, 8) && m1 == kMetaMagic;
+        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &img, 8) ||
+            !f.read((char*) &m1, 8) || m1 != kMetaMagic) return false;
+        return maya::glm_slots::read_owner(f, thread);
     };
     const auto slot_age_days = [](const std::string& p) {
         std::error_code ec;
@@ -1493,7 +1502,7 @@ static int glm_pack_generate(const Options& o) {
                                                  : std::filesystem::path(o.glm_pack) / "slots";
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
-        struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; uint64_t img; };
+        struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; uint64_t img; ThreadTurn thread{}; };
         std::vector<Found> found;
         size_t refused = 0;
         for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {   // a previous run's slots
@@ -1509,7 +1518,7 @@ static int glm_pack_generate(const Options& o) {
             const std::string bin = p.substr(0, p.size() - 5) + ".bin";
             Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec), kNoImages};
             const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-            if (meta_read(p, fd.toks, fd.bytes, fd.img) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
+            if (meta_read(p, fd.toks, fd.bytes, fd.img, fd.thread) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
                 found.push_back(std::move(fd));
             } else {
                 ++refused;
@@ -1527,12 +1536,25 @@ static int glm_pack_generate(const Options& o) {
         std::sort(found.begin(), found.end(), [](const Found& a, const Found& b) { return a.t < b.t; });
         uint64_t total = 0;
         for (auto& fd : found) {
+            // A crash after publishing the new metadata can leave the previous pair beside it.
+            if (!fd.thread.key.empty()) {
+                auto prior = std::find_if(slots.begin(), slots.end(), [&](const Slot& slot) {
+                    return slot.thread.same(fd.thread);
+                });
+                if (prior != slots.end()) {
+                    fs::remove(meta_of(prior->path), ec);
+                    fs::remove(prior->path, ec);
+                    total -= prior->bytes;
+                    slots.erase(prior);
+                }
+            }
             total += fd.bytes;
             slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock});
             // a system prompt's state (slot_prefix) goes only as the least recently used, after a restart too: the
             // .meta has no flag for it, its tokens tell (no user turn)
-            slots.back().prefix = maya::core::is_system_prefix(slots.back().tokens, 154827);
+            slots.back().prefix = fd.thread.key.empty() && maya::core::is_system_prefix(slots.back().tokens, 154827);
             slots.back().img = fd.img;
+            slots.back().thread = std::move(fd.thread);
         }
         if (slot_keep) {
             std::ostringstream m;
@@ -1564,17 +1586,24 @@ static int glm_pack_generate(const Options& o) {
         return lru;
     };
     // the conversation in the model (its snapshot, snap_tokens) into a slot
-    const auto slot_put = [&](const char* why) {
+    const auto slot_put = [&](const char* why, bool system_prefix = false) {
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min) return;
         if (model.ablating()) return;   // (--ablate: a projected conversation is not kept - it is read again)
-        // an earlier state of this conversation is superseded (the same pictures: the same tokens with other
-        // pictures are another conversation)
-        for (size_t i = slots.size(); i-- > 0;)
-            if (!slots[i].anchor && !slots[i].prefix && slots[i].img == snap_img_hash &&
-                slots[i].tokens.size() <= snap_tokens.size() &&
-                std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
-                slot_drop(i);
-        while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
+        const auto& owner = owners[(size_t) cur_ctx];
+        const ThreadTurn thread = system_prefix ? ThreadTurn{} : owner.turn;
+        if (!system_prefix && owner.retired) return;
+        for (const auto& slot : slots)
+            if (slot.thread.newer(thread)) return;
+        // Publish only after the model state and its metadata are durable (or the RAM copy succeeded).
+        const auto replace = [&] {
+            for (size_t i = slots.size(); i-- > 0;) {
+                const auto& slot = slots[i];
+                if (maya::glm_slots::supersedes(thread, slot.thread, slot.prefix, slot.anchor,
+                                                slot.img == snap_img_hash, snap_tokens, slot.tokens)) slot_drop(i);
+            }
+            ConversationOwner::parked(owners, thread);
+            while (slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
+        };
         if (slot_ram) {   // the conversation is parked in a host buffer; nothing touches the disk
             const auto t0 = std::chrono::steady_clock::now();
             std::string e;
@@ -1586,7 +1615,9 @@ static int glm_pack_generate(const Options& o) {
                      ") - it is not parked and will be read from token 0 when it comes back");
                 return;
             }
+            replace();
             slots.push_back({snap_tokens, "", bytes, ++slot_clock});
+            slots.back().thread = thread;
             slots.back().data = buf;
             slots.back().img = snap_img_hash;
             snap_in_slot = true;
@@ -1622,14 +1653,16 @@ static int glm_pack_generate(const Options& o) {
         std::string e;
         const uint64_t bytes = model.slot_save(path + ".tmp", e);
         if (bytes == 0 || (std::filesystem::rename(path + ".tmp", path, ec), ec) ||
-            !meta_write(meta_of(path), snap_tokens, bytes, snap_img_hash)) {
+            !meta_write(meta_of(path), snap_tokens, bytes, snap_img_hash, thread)) {
             std::filesystem::remove(path + ".tmp", ec);
             std::filesystem::remove(path, ec);
             std::fprintf(stderr, "glm slots: setting the conversation aside failed (%s)\n",
                          e.empty() ? "writing its files" : e.c_str());
             return;
         }
+        replace();
         slots.push_back({snap_tokens, path, bytes, ++slot_clock});
+        slots.back().thread = thread;
         slots.back().img = snap_img_hash;
         snap_in_slot = true;
         uint64_t total = 0;
@@ -1657,8 +1690,9 @@ static int glm_pack_generate(const Options& o) {
         size_t best = SIZE_MAX, len = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto& t = slots[i].tokens;
-            if (t.size() > len && t.size() < prompt.size() && std::equal(t.begin(), t.end(), prompt.begin()) &&
-                img_hash(t.size()) == slots[i].img) {
+            const bool prefer = req_thread.same(slots[i].thread) && best != SIZE_MAX &&
+                                !req_thread.same(slots[best].thread);
+            if (maya::glm_slots::candidate(t, prompt, len, prefer) && img_hash(t.size()) == slots[i].img) {
                 best = i;
                 len = t.size();
             }
@@ -1798,7 +1832,7 @@ static int glm_pack_generate(const Options& o) {
         snap_tokens.assign(prompt.begin(), prompt.begin() + (long) p);
         snap_img_hash = img_hash(p);
         snap_in_slot = false;
-        slot_put(" (its system prompt, for other chats that start with it)");
+        slot_put(" (its system prompt, for other chats that start with it)", true);
         if (snap_in_slot && !slots.empty() && slots.back().tokens.size() == p) slots.back().prefix = true;
     };
     // the state now (after prompt[0, p)) into a free or the least recently used checkpoint (at_pos: the state after
@@ -1879,6 +1913,9 @@ static int glm_pack_generate(const Options& o) {
         // --ablate: the state, its snapshot and its checkpoints were read with this conversation's setting - a request
         // with the other one reuses none of them (the prompt is read from the start); projected states are never kept
         // as slots or in the prompt cache (slot_put / below), and none is taken back for a projecting request
+        auto& owner = owners[(size_t) cur_ctx];
+        if (!owner.turn.key.empty() && (owner.turn.key != req_thread.key || owner.turn.order != req_thread.order))
+            slot_put("");  // preserve the last usable turn before an edit, failure or anonymous continuation
         const bool abl_want = abl_req();
         const bool abl_flip = model.ablate_loaded() && abl_want != model.ablating();
         const bool snap_ok = !abl_flip && model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
@@ -1940,6 +1977,7 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (reuse == 0 && !abl_want) reuse = maya::core::glmpc::engine_take(model, prompt, cur_img_pos.empty(), snap_tokens, snap_img_hash, snap_in_slot, kNoImages);   // glm-dsa B14.14
+        owner = {req_thread, !req_thread.key.empty()};  // a partial tagged read cannot replace a usable turn
         if (reuse == 0) model.reset();
         if (model.ablate_loaded()) {   // (the conversation's setting from here on: the state it holds now is read so)
             model.set_ablate(abl_want);
@@ -2215,6 +2253,11 @@ static int glm_pack_generate(const Options& o) {
             }
             if (read_stopped()) { finish = "cancel"; break; }
         }
+        if (!req_thread.key.empty() && std::strcmp(finish, "cancel") != 0 && !snap_tokens.empty()) {
+            owner.retired = std::any_of(slots.begin(), slots.end(), [&](const Slot& slot) {
+                return slot.thread.newer(req_thread);
+            });
+        }
         {   // one line a prompt: the tokens read, the time, and the free VRAM before and after (issues #648, #438)
             const std::string vt = maya::core::vram_mark_text(vram0, maya::core::vram_mark(vram_devs()));
             if (!vt.empty())
@@ -2237,11 +2280,11 @@ static int glm_pack_generate(const Options& o) {
                 // anchored there, for this chat's next turn
                 bool held = false;
                 for (auto& sl : slots)
-                    if (sl.tokens == snap_tokens) sl.anchor = held = true;
+                    if (sl.tokens == snap_tokens && sl.thread.key == owners[cur_ctx].turn.key) sl.anchor = held = true;
                 if (!held && !snap_tokens.empty()) {
                     slot_put(" (a paused request's prompt, kept for its next turn)");
                     for (auto& sl : slots)
-                        if (sl.tokens == snap_tokens) sl.anchor = true;
+                        if (sl.tokens == snap_tokens && sl.thread.key == owners[cur_ctx].turn.key) sl.anchor = true;
                 }
             }
             if (p > (int64_t) prompt.size() && p < full && model.snapshot_save()) {
@@ -2612,7 +2655,6 @@ static int glm_pack_generate(const Options& o) {
         bool busy = false;
     };
     std::vector<Ctx> ctxs((size_t) model.seq_count());
-    int cur_ctx = 0;
     uint64_t ctx_clock = 0;
     const auto bind_ctx = [&](int c) {
         if (c != cur_ctx) {
@@ -2676,6 +2718,7 @@ static int glm_pack_generate(const Options& o) {
         std::vector<int64_t> img_pos;
         std::vector<float> img_rows;
         std::vector<std::pair<int32_t, float>> bias;
+        ThreadTurn thread;
         int abl = -1;   // its GEN ablate= (-1: --ablate-default)
     };
     std::deque<Pending> pending;
@@ -3150,7 +3193,8 @@ static int glm_pack_generate(const Options& o) {
                         std::equal(k.tokens.begin(), k.tokens.end(), g->prompt.begin()))
                         len = k.tokens.size();
             }
-            if (len > blen) {
+            if ((best < 0 && (len || (!owners[c].retired && owners[c].turn.same(req_thread)))) ||
+                (best >= 0 && maya::glm_slots::prefer_lane(len, owners[c], blen, owners[best], req_thread))) {
                 best = c;
                 blen = len;
             }
@@ -3169,7 +3213,7 @@ static int glm_pack_generate(const Options& o) {
                 return;
             }
             pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows,
-                               req_bias, req_abl});
+                               req_bias, req_thread, req_abl});
             std::fprintf(stderr, "glm multi: request %d waits for a context that holds %lld tokens\n", rid,
                          (long long) want);
             return;
@@ -3323,6 +3367,7 @@ static int glm_pack_generate(const Options& o) {
             req_think_end = w2.think_end;
             req_bias = std::move(w2.bias);
             req_abl = w2.abl;
+            req_thread = std::move(w2.thread);
             cur_img_pos = std::move(w2.img_pos);
             cur_img_rows = std::move(w2.img_rows);
             gen_admit(w2.rid, w2.ids, w2.max_new, w2.rq);
@@ -4466,6 +4511,7 @@ static int glm_pack_generate(const Options& o) {
             double req_msw = -1.0;   // ... and its light-miss bar / first layer (MAYA_GLM_MISS_SKIP_W / _FROM; < 0: the engine's)
             int req_msf = -1;
             int req_rid = -1;
+            req_thread = {};
             req_spec = 0;
             req_spec_min_p = -1.0;
             req_spec_n_min = -1;
@@ -4501,6 +4547,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "read_chunks") { req_chunks = std::atoi(v.c_str()); }
                 else if (k == "miss_skip_w") { req_msw = std::atof(v.c_str()); }
                 else if (k == "miss_skip_from") { req_msf = std::atoi(v.c_str()); }
+                else if (k == "thread") { req_thread = maya::threads::parse_thread(v); }
                 else if (k == "rid") { req_rid = std::atoi(v.c_str()); }
                 else if (k == "spec") { req_spec = std::atoi(v.c_str()); }
                 else if (k == "spec_min_p") { req_spec_min_p = std::atof(v.c_str()); }

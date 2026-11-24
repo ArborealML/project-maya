@@ -6194,7 +6194,8 @@ def make_handler(svc: Service):
             super().send_response(code, message)
 
         def _inference_thread(self):
-            if not getattr(svc.template, "deepseek", False):
+            if not (getattr(svc.template, "deepseek", False) or
+                    (getattr(svc.template, "glm_effort", False) and not getattr(svc.template, "glm_dsa", False))):
                 return None
             values = self.headers.get_all("X-Inference-Thread", [])
             if len(values) != 1:
