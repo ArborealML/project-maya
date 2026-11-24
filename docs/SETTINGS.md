@@ -238,6 +238,16 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_WEB_UI` | on | the server: Maya's web page (`/`, `/web/*`, `/fonts/*`). `0` = off (as `"web_ui": false` in the config): an API-only server - those paths answer 404 as any unknown one, while `/v1/*`, `/v1/messages`, Maya's model API and `/health` answer as before; the page's data routes (`/settings`, `/metrics`, `/mcp`, `/api/*`, `/status`) need the API key when one is set, page or no page. A setup again keeps the config's `"web_ui"` |
 | `MAYA_VIDEO_MAX_FRAMES` | 240 | the server (GLM): the most frames a video may give (read at 4 a second, so 240 = a minute); a longer video is refused before it is decoded, with its length in the message. Every frame takes an image's share of the context. Videos need ffmpeg and ffprobe installed |
 
+GLM-5.3-Flash accepts one caller-scoped `X-Inference-Thread` header on chat, Messages and Responses requests.
+It accepts 1–256 printable ASCII characters after trimming outer spaces and tabs. Missing, repeated or
+invalid headers use ordinary content-based parking. With GLM conversation slots enabled, a successful RAM or disk save replaces the previous parked
+turn for that thread, including after an edit. A late-finishing older request cannot replace a
+newer parked turn. With `MAYA_GLM_SLOT_KEEP=1`, the disk metadata retains the digest across
+restarts. Existing slots without a digest remain available by content. GLM restores a parked
+snapshot only when its complete token prefix and images match. An edit can instead resume from
+a matching live lane checkpoint or a shared system-prefix slot. With neither, GLM reads the
+edited prompt from the start. Slot count, minimum size and eviction settings still apply.
+
 **The expert profile** (`data/expert-profile-glm.bin`). At start the engine fills VRAM with the experts a profile ranks
 first. That profile ranks every (layer, expert) pair, and its order also decides how many VRAM slots each layer
 gets - except the MTP draft layer on a split, which runs on every drafted token and so keeps at least an equal share
