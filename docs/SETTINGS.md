@@ -2073,6 +2073,15 @@ engine is unchanged unless asked.
 | `MAYA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |
 | `MAYA_DS4_SLOT_DAYS` | 7 | a slot not used for this many days is removed at start; so is any file not this model's, another engine's, or incomplete. The engine's end (QUIT or the end of its input) writes the conversations in RAM to the folder, so a restart reads on from them (the server gives it `MAYA_ENGINE_QUIT_S`, 50 s, to do so) |
 
+DeepSeek chat, Messages and Responses requests may send one `X-Inference-Thread` header
+(1–256 printable ASCII characters after trimming outer spaces and tabs). With conversation slots enabled,
+Maya keeps one parked state per identified thread in the loaded model, including across restarts.
+Changing a tail or editing an earlier message replaces that thread's previous parked state.
+The slot folder contains a digest scoped to the API credential. Missing, repeated or invalid headers
+use the ordinary content-based parking rules. A thread name alone authorizes zero reused tokens.
+In serial and parallel serving, reuse ends at a matching saved state or checkpoint, with matching
+tokens and pictures. Shared system prompts and tools remain available across threads.
+
 The client sends each assistant turn's `reasoning_content` back with the turn, as it got it: from `content` alone the
 prompt differs from the state and nothing is reused - no error and no log line.
 
