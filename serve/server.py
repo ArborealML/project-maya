@@ -1528,13 +1528,17 @@ class StrataEngine:
         bias = sampling.get("logit_bias")      # {id: bias}, checked by the handler (logit_bias_of)
         bias_key = (" logit_bias=" + ",".join(f"{int(i)}:{float(b):g}" for i, b in sorted(bias.items()))
                     if isinstance(bias, dict) and bias else "")
+        # Only the HTTP handler can supply a tuple (JSON has no tuples). The bounded digest and
+        # admission order survive background jobs, fair slicing and both serial and tagged GEN lines.
+        thread = sampling.get("_inference_thread")
+        thread_key = f" thread={thread[0]}:{thread[1]}" if isinstance(thread, tuple) else ""
         penalty_keys = StrataEngine.penalty_keys(sampling)
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic) - but
             # the penalties do: they change the logits greedy picks from (#273: a greedy answer's loops)
             return (" temperature=0" + penalty_keys + think + tune_keys + StrataEngine.projection_key(sampling) +
-                    bias_key + StrataEngine.restore_keys(sampling) + StrataEngine.logprob_key(sampling))
+                    bias_key + thread_key + StrataEngine.restore_keys(sampling) + StrataEngine.logprob_key(sampling))
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
@@ -1552,7 +1556,7 @@ class StrataEngine:
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
         keys += think + tune_keys
-        return (keys + StrataEngine.projection_key(sampling) + bias_key + StrataEngine.restore_keys(sampling) +
+        return (keys + StrataEngine.projection_key(sampling) + bias_key + thread_key + StrataEngine.restore_keys(sampling) +
                 StrataEngine.logprob_key(sampling))
 
     @staticmethod
@@ -6175,6 +6179,8 @@ def parse_cors_origins(value) -> list[str]:
 
 
 def make_handler(svc: Service):
+    thread_order = itertools.count(1)
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
         answer_started = False                              # a malformed request's 400 only replaces an answer not begun
@@ -6186,6 +6192,18 @@ def make_handler(svc: Service):
         def send_response(self, code, message=None):
             self.answer_started = True
             super().send_response(code, message)
+
+        def _inference_thread(self):
+            if not getattr(svc.template, "deepseek", False):
+                return None
+            values = self.headers.get_all("X-Inference-Thread", [])
+            if len(values) != 1:
+                return None
+            value = values[0].strip(" \t")
+            if not 1 <= len(value) <= 256 or not value.isascii() or not value.isprintable():
+                return None
+            digest = hashlib.sha256((self._response_owner() + "\0" + value).encode("ascii")).hexdigest()
+            return digest, next(thread_order)
 
         def _body(self) -> bytes:
             """The request body: Content-Length checked first (a bad one is a 400, one over body_limit() a 413 before
@@ -6476,6 +6494,7 @@ def make_handler(svc: Service):
             oreq = model_api.chat_to_openai(req) if kind == "chat" else model_api.generate_to_openai(req)
             svc.keep_alive_s = ka                               # (the model stays loaded that long after this request)
             oreq = svc.with_shared(oreq, "openai")
+            oreq["_inference_thread"] = self.inference_thread
             oreq["_api"] = "openai"
             svc.check_request(oreq)
             messages, tools, kw = openai_to_messages(oreq, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
@@ -6959,6 +6978,7 @@ def make_handler(svc: Service):
             if not self._authorized() or self._foreign_page():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            self.inference_thread = self._inference_thread()
             try:
                 if path in ("/models/load", "/models/unload"):
                     self._llamacpp_model(path.rsplit("/", 1)[1])
@@ -7299,6 +7319,7 @@ def make_handler(svc: Service):
             validation = sampling.pop("_response_validation")
             history = input_items(req["input"]) if req.get("store") else None
             sampling = svc.with_shared(sampling, "openai")
+            sampling["_inference_thread"] = self.inference_thread
             sampling["_api"] = "openai"
             sampling["_responses"] = True
             svc.check_request(sampling)
@@ -7372,6 +7393,7 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            req["_inference_thread"] = self.inference_thread
             req["_api"] = "web" if req.get("strata_resume") is True else "openai"   # the Monitor's request table
             svc.check_request(req)                             # a bad sampling field or logit_bias: a 400, now
             messages, tools, kw = openai_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))
@@ -7481,6 +7503,7 @@ def make_handler(svc: Service):
 
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
+            req["_inference_thread"] = self.inference_thread
             req["_api"] = "anthropic"
             svc.check_request(req)                             # a bad sampling field: a 400, now
             messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False), glm_dsa=getattr(svc.template, "glm_dsa", False))

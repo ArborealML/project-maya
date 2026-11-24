@@ -24,6 +24,7 @@
 #include "ds4_evt.hpp"
 #include "ds4_logprobs.hpp"
 #include "ds4_marks.hpp"
+#include "ds4_thread.hpp"
 #include "ds4_gguf.cuh"       // (--pack-info: the types the kernels take, asked of them)
 #include "ds4_iq.cuh"
 #include "ds4_model.hpp"
@@ -566,6 +567,7 @@ struct Req {
     }
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
+    maya::ds4::ThreadTurn thread;
     long long rid = -1;   // rid=<id> (--parallel: every request's, its lines tagged with it)
     // marks=<pos>,... and shared=<pos>: restore points the read keeps (the server's: the start of the last user
     // message, a point near the prompt's tail; the end of a start other conversations share, given up last) - a later
@@ -713,6 +715,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "think_stop") { for (int x : parse_ids(v)) r.soft_stop.insert(x); }
         else if (k == "think_weak") { for (int x : parse_ids(v)) r.soft_weak.insert(x); }
         else if (k == "think_dig") { for (int x : parse_ids(v)) r.soft_dig.insert(x); }
+        else if (k == "thread") r.thread = maya::ds4::parse_thread(v);
         else if (k == "rid") r.rid = std::atoll(v.c_str());
         else if (k == "ablate") r.ablate = std::atoi(v.c_str()) != 0;
         else if (k == "cold") r.cold = std::atoi(v.c_str()) != 0;
@@ -903,6 +906,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     }();
     namespace fs = std::filesystem;
     std::filesystem::path slot_dir;
+    std::vector<maya::ds4::ConversationOwner> owners((size_t) m.seq_count());
     struct Slot {
         std::vector<int32_t> tokens;
         std::string path;                            // empty: the state is in data (RAM)
@@ -910,6 +914,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
         std::vector<int64_t> cks;                     // the positions short of its end it can be taken back at
         std::vector<Pic> pics;                        // the pictures it holds (start, hash; len once it is loaded)
+        maya::ds4::ThreadTurn thread;
     };
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
@@ -927,7 +932,8 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     };
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
     const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes,
-                                const std::vector<int64_t>& cks, const std::vector<Pic>& pics) -> bool {
+                                const std::vector<int64_t>& cks, const std::vector<Pic>& pics,
+                                const maya::ds4::ThreadTurn& thread) -> bool {
         const std::string tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -948,6 +954,8 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                 f.write((const char*) &q.hash, 8);
             }
             f.write((const char*) &kMetaMagic, 8);
+            // Optional fixed-size trailer. Anonymous and pre-thread DS4META3 files end at the magic.
+            if (!thread.key.empty()) f.write(thread.key.data(), (std::streamsize) thread.key.size());
             f.flush();
             if (!f) return false;
         }
@@ -958,7 +966,8 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     // a .meta of this model -> its tokens, the slot's size and its pictures (false: foreign, damaged or not this
     // model's)
     const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
-                               std::vector<int64_t>& cks, std::vector<Pic>& pics) -> bool {
+                               std::vector<int64_t>& cks, std::vector<Pic>& pics,
+                               maya::ds4::ThreadTurn& thread) -> bool {
         std::ifstream f(path, std::ios::binary);
         uint64_t m0 = 0, il = 0, nt = 0, nc = 0, np = 0, m1 = 0;
         if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
@@ -982,6 +991,12 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             pics.push_back(q);
         }
         if (!f.read((char*) &m1, 8) || m1 != kMetaMagic) return false;
+        if (f.peek() != std::char_traits<char>::eof()) {
+            std::string key(64, '\0');
+            if (!f.read(key.data(), 64) || !maya::ds4::thread_digest(key) || f.peek() != std::char_traits<char>::eof())
+                return false;
+            thread = {std::move(key), 0};  // every request admitted after restart is newer
+        }
         for (int64_t c : cks)
             if (c <= 0 || (uint64_t) c > nt) return false;
         return true;
@@ -1071,7 +1086,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             }
         }
         fs::rename(path + ".tmp", path, ec);
-        if (ec || !meta_write(meta_of(path), s.tokens, s.data->size(), s.cks, s.pics)) {
+        if (ec || !meta_write(meta_of(path), s.tokens, s.data->size(), s.cks, s.pics, s.thread)) {
             std::filesystem::remove(path + ".tmp", ec);
             std::filesystem::remove(path, ec);
             std::fprintf(stderr, "ds4 slots: writing %s failed\n", path.c_str());
@@ -1086,6 +1101,10 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     // the conversation in the model into a slot (the state is lost otherwise: another one takes the model)
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0 || m.ablating()) return;   // (an abliterated conversation is not kept: read again)
+        const auto& owner = owners[(size_t) m.seq_bound()];
+        if (owner.retired) return;
+        if (std::any_of(slots.begin(), slots.end(), [&](const Slot& s) { return s.thread.newer(owner.turn); }))
+            return;
         const std::vector<int32_t>& t = m.tokens();
         if (t.size() < slot_min) return;   // (a fresh engine's 0-token state is no conversation: nothing to set aside)
         std::vector<maya::ds4::PicMark> marks;   // (the state's pictures: what the slot keeps of them - no pixels,
@@ -1104,9 +1123,10 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             return;
         }
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
-            if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
+            if (maya::ds4::replaces_slot(owner.turn, slots[i].thread, t, slots[i].tokens))
                 slot_drop(i);
-        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), {}});
+        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), {}, owner.turn});
+        maya::ds4::ConversationOwner::parked(owners, owner.turn);
         slots.back().data = buf;
         slots.back().pics.clear();
         for (const auto& k : marks)
@@ -1145,21 +1165,20 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
     // places, their pixels) the prompt agrees with up to that point comes back too: the KV of a picture's span needs
     // the same picture (the tokens alone are all the image token, whatever the image).
     const auto slot_take = [&](const std::vector<int>& prompt, const std::vector<Pic>& want, size_t floor,
-                               bool& whole) -> size_t {
+                               bool& whole, const maya::ds4::ThreadTurn& thread) -> size_t {
         whole = false;
         if (slot_max <= 0 || prompt.size() < 2) return 0;
         size_t best = SIZE_MAX, len = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto& t = slots[i].tokens;
-            const size_t lim = std::min(t.size(), prompt.size() - 1);   // (a prompt always reads its last token)
-            size_t c = 0;
-            while (c < lim && t[c] == prompt[c]) ++c;
-            size_t u = c == t.size() ? c : 0;
-            if (u == 0)
-                for (int64_t k : slots[i].cks)
-                    if ((size_t) k <= c && (size_t) k > u) u = (size_t) k;
-            if (u == 0 || u <= len || u <= floor) continue;
-            if (!pics_match(slots[i].pics, want, u)) continue;   // (another picture, another place: not this state)
+            size_t pic_limit = std::min(t.size(), prompt.size() - 1);
+            for (const Pic& q : want)
+                if ((size_t) q.start < pic_limit && !pic_same(slots[i].pics, q)) pic_limit = (size_t) q.start;
+            for (const Pic& q : slots[i].pics)
+                if ((size_t) q.start < pic_limit && !pic_same(want, q)) pic_limit = (size_t) q.start;
+            const size_t u = maya::ds4::slot_reuse(t, prompt, slots[i].cks, pic_limit);
+            const bool prefer = thread.same(slots[i].thread) && best != SIZE_MAX && !thread.same(slots[best].thread);
+            if (u <= floor || u < len || (u == len && !prefer)) continue;
             best = i;
             len = u;
         }
@@ -1185,6 +1204,16 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                     else e = "reading " + slots[best].path + " failed";
                 } else e = slots[best].path + " is empty";
             } else e = "cannot read " + slots[best].path;
+        }
+        // Disk metadata is an index. The payload's own tokens and picture marks authorize reuse.
+        if (back) {
+            std::vector<Pic> actual;
+            for (const auto& k : marks) actual.push_back({k.start, 0, 0, k.hash, (size_t) k.len, {}});
+            if (!std::equal(prompt.begin(), prompt.begin() + len, m.tokens().begin()) || !pics_match(actual, want, len)) {
+                back = false;
+                e = "the saved payload differs from its index";
+                m.reset();
+            }
         }
         if (!back) {
             note("taking a conversation back failed (" + (e.empty() ? std::string("it did not load") : e) +
@@ -1321,6 +1350,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                 std::vector<int64_t> cks;
                 std::vector<Pic> pics;
                 fs::file_time_type t;
+                maya::ds4::ThreadTurn thread;
             };
             std::vector<Found> found;
             size_t refused = 0;
@@ -1335,9 +1365,9 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                 }
                 if (!is_meta) continue;      // a .bin is judged by its .meta
                 const std::string bin = p.substr(0, p.size() - 5) + ".bin";
-                Found fd{bin, {}, 0, {}, {}, fs::last_write_time(de.path(), ec)};
+                Found fd{bin, {}, 0, {}, {}, fs::last_write_time(de.path(), ec), {}};
                 const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-                if (meta_read(p, fd.toks, fd.bytes, fd.cks, fd.pics) && have == fd.bytes && fd.bytes > 0 &&
+                if (meta_read(p, fd.toks, fd.bytes, fd.cks, fd.pics, fd.thread) && have == fd.bytes && fd.bytes > 0 &&
                     slot_age_days(p) <= slot_days)
                     found.push_back(std::move(fd));
                 else {
@@ -1357,7 +1387,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             for (auto& fd : found) {
                 total += fd.bytes;
                 slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks),
-                                 std::move(fd.pics)});
+                                 std::move(fd.pics), std::move(fd.thread)});
             }
             std::string msg = "folder " + slot_dir.string() + ": " + std::to_string(slots.size()) +
                               " conversation(s) kept from earlier runs (" + gb(total) + ")";
@@ -1541,6 +1571,13 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                 return false;
             }
         }
+        if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
+            std::printf("ERR%s the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", tag.c_str(),
+                        r.ids.size(), r.max_new, (long long) m.max_context());
+            std::fflush(stdout);
+            return false;
+        }
+        auto& owner = owners[(size_t) m.seq_bound()];
         const auto& st = m.tokens();
         const size_t n_state = st.size();
         size_t c = 0;
@@ -1571,7 +1608,11 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
         // (the start of a run, so every restart) holds 0 tokens, and every prompt "continues" that to token 0; taken
         // as a continuation, the take below would never run for the folder's conversations, the case they are for
-        if (!state_is_prefix && n_state > 0 && c == n_state && n_state < r.ids.size()) {
+        const bool extends = !state_is_prefix && n_state > 0 && c == n_state && n_state < r.ids.size();
+        if (extends && (r.thread.key.empty() || (!owner.retired && owner.turn.same(r.thread)))) {
+            // Another caller can continue these exact tokens. Preserve the outgoing named primary
+            // before its tensors are extended by a different thread or an older overlapping request.
+            if (!owner.turn.key.empty() && (!owner.turn.same(r.thread) || owner.turn.newer(r.thread))) slot_put("");
             from = n_state;
             continued = true;
         }
@@ -1582,14 +1623,14 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             if (slot_max > 0 && !state_is_prefix) slot_put("");   // (a shared start is nobody's conversation)
             beat();
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
-            const int64_t rs = m.restorable(limit);
+            const int64_t rs = extends ? (int64_t) n_state : m.restorable(limit);
             bool whole = false;
             // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation
             //  only when it covers more than either)
             const int pi = abl || r.cold ? -1 : prefix_find(r.ids, pics, rs > 0 ? (size_t) rs : 0);
             const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
             const size_t back =
-                abl || r.cold ? 0 : slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
+                abl || r.cold ? 0 : slot_take(r.ids, pics, std::max(rs > 0 ? (size_t) rs : 0, plen), whole, r.thread);
             beat();
             if (back > 0) {
                 from = back;
@@ -1597,6 +1638,9 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             } else if (pi >= 0 && prefix_take(pi)) {
                 from = plen;
                 held.clear();
+            } else if (extends && (size_t) m.pos() == n_state) {
+                from = n_state;
+                continued = true;
             } else if (!r.cold && rs >= 0 && m.restore(limit))
                 from = (size_t) m.pos();
             else m.reset();
@@ -1605,13 +1649,10 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         m.set_ablate(abl);
         if (from == 0) held.clear();   // (a slot that came back set held itself: its pictures' marks, not only start
                                        //  and hash, so the spans already in the KV are not encoded again)
-        if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
-            std::printf("ERR%s the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", tag.c_str(),
-                        r.ids.size(),
-                        r.max_new, (long long) m.max_context());
-            std::fflush(stdout);
-            return false;
-        }
+        // A cancelled in-place extension can restore its original checkpoint. Other reads publish
+        // ownership only once the new prompt and its checkpoints are complete.
+        if (!extends || !owner.turn.same(r.thread) || owner.turn.newer(r.thread))
+            owner = {{}, !r.thread.key.empty() || !owner.turn.key.empty()};
         std::string err;
         bool ok = true;
         // the pictures whose spans the prompt reads (the rest the state holds): encoded (or the cache's), checked
@@ -1859,7 +1900,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         }
         return true;
     };
-    const auto prompt_end = [&](Prompt& P) {
+    const auto prompt_end = [&](Prompt& P, const Req& r) {
         {   // one line a prompt: the tokens read, the time, and the free VRAM before and after (issues #648, #438)
             const std::string vt = maya::core::vram_mark_text(P.v0, maya::core::vram_mark(g_vram_gpus));
             if (!vt.empty())
@@ -1877,12 +1918,13 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
             held = std::move(nh);
         }
         m.checkpoint(0);
+        owners[(size_t) m.seq_bound()] = {r.thread, m.ablating()};
         if (!P.continued) m.pin();   // (a new run of prompts: where it may be rendered again from)
     };
     const auto prompt_in = [&](Req& r, bool geni, const std::string& tag, const std::function<bool()>& stop_now,
                                Prompt& P) -> bool {
         if (!prompt_begin(r, geni, tag, P) || !prompt_piece(r, tag, stop_now, P, r.ids.size())) return false;
-        prompt_end(P);
+        prompt_end(P, r);
         return true;
     };
     const bool multi = m.seq_count() > 1;
@@ -2212,7 +2254,7 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
         };
         // its prompt read: its first token picked, and it writes from the next turn on
         const auto start_answer = [&](Act& a) {
-            prompt_end(a.P);
+            prompt_end(a.P, a.r);
             a.reading = false;
             a.t1 = now_ms();
             a.sd = m.stats();
@@ -2278,10 +2320,14 @@ int serve(maya::ds4::Model& m, const std::string& eos_list, bool spec, float con
                 int64_t u = 0;
                 if (!st.empty() && c == st.size() && st.size() < r.ids.size()) u = (int64_t) st.size();
                 else if (c > 0) u = std::max<int64_t>(0, m.restorable((int64_t) std::min(c, r.ids.size() - 1)));
+                const auto preferred = [&](int lane) {
+                    const auto& owner = owners[(size_t) lane];
+                    return !owner.retired && r.thread.same(owner.turn);
+                };
                 const bool better = best < 0 || u > best_u ||
-                                    (u == best_u && (st.empty() != m.seq_tokens(best).empty()
-                                                         ? st.empty()
-                                                         : seq_used[(size_t) s] < seq_used[(size_t) best]));
+                    (u == best_u && (preferred(s) != preferred(best) ? preferred(s) :
+                                     st.empty() != m.seq_tokens(best).empty() ? st.empty() :
+                                     seq_used[(size_t) s] < seq_used[(size_t) best]));
                 if (better) best = s, best_u = u;
             }
             if (best < 0) {   // (the server gives each conversation one request: a request over that waits)
